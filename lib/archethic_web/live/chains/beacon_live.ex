@@ -13,17 +13,19 @@ defmodule ArchethicWeb.BeaconChainLive do
   alias Archethic.Election
 
   alias Archethic.P2P
-  alias Archethic.P2P.Message.GetTransactionChain
-  alias Archethic.P2P.Message.GetBeaconSummaries
   alias Archethic.P2P.Message.BeaconSummaryList
+  alias Archethic.P2P.Message.GetBeaconSummaries
+  alias Archethic.P2P.Message.GetLastTransactionAddress
+  alias Archethic.P2P.Message.GetTransactionChain
+  alias Archethic.P2P.Message.LastTransactionAddress
   alias Archethic.P2P.Message.NotFound
   alias Archethic.P2P.Message.TransactionList
+
   alias Archethic.P2P.Node
+
   alias Archethic.PubSub
 
   alias Archethic.SelfRepair.Sync.BeaconSummaryHandler
-
-  alias Archethic.TaskSupervisor
 
   alias Archethic.TransactionChain.Transaction
   alias Archethic.TransactionChain.TransactionData
@@ -79,33 +81,32 @@ defmodule ArchethicWeb.BeaconChainLive do
     page = Map.get(params, "page", "1")
 
     case Integer.parse(page) do
-      {number, ""} when number > 0 and is_list(dates) ->
-        if number > length(dates) do
-          {:noreply,
-           push_redirect(socket, to: Routes.live_path(socket, __MODULE__, %{"page" => 1}))}
-        else
-          new_assign =
-            socket
-            |> assign(:current_date_page, number)
-            |> assign(:transactions, [])
-            |> assign(:fetching, true)
+      {1, ""} ->
+        send(self(), :initial_load)
 
-          if Enum.at(dates, 0) == Enum.at(dates, number - 1) do
-            next_summary_date =
-              dates
-              |> Enum.at(number - 1)
+        new_assign =
+          socket
+          |> assign(:current_date_page, 1)
+          |> assign(:transactions, [])
+          |> assign(:fetching, true)
 
-            send(self(), {:initial_load, next_summary_date})
-          else
-            date =
-              dates
-              |> Enum.at(number - 1)
+        {:noreply, new_assign}
 
-            send(self(), {:load_at, date})
-          end
+      {number, ""} when number > length(dates) ->
+        {:noreply,
+         push_redirect(socket, to: Routes.live_path(socket, __MODULE__, %{"page" => 1}))}
 
-          {:noreply, new_assign}
-        end
+      {number, ""} ->
+        new_assign =
+          socket
+          |> assign(:current_date_page, number)
+          |> assign(:transactions, [])
+          |> assign(:fetching, true)
+
+        date = Enum.at(dates, number, -1)
+        send(self(), {:load_at, date})
+
+        {:noreply, new_assign}
 
       _ ->
         {:noreply, socket}
@@ -120,8 +121,8 @@ defmodule ArchethicWeb.BeaconChainLive do
     {:noreply, push_redirect(socket, to: Routes.live_path(socket, __MODULE__, %{"page" => page}))}
   end
 
-  def handle_info({:initial_load, next_summary_time}, socket) do
-    transactions = list_transaction_by_date_from_tx_chain(next_summary_time)
+  def handle_info(:initial_load, socket) do
+    transactions = list_transaction_from_current_chain()
 
     new_socket =
       socket
@@ -133,11 +134,7 @@ defmodule ArchethicWeb.BeaconChainLive do
   end
 
   def handle_info({:load_at, date}, socket) do
-    # Caching transactions = list_transaction_by_date(date)
-    {:ok, transactions} =
-      TransactionCache.resolve(date, fn ->
-        list_transaction_by_date(date)
-      end)
+    {:ok, transactions} = TransactionCache.resolve(date, fn -> list_transaction_by_date(date) end)
 
     new_assign =
       socket
@@ -193,22 +190,16 @@ defmodule ArchethicWeb.BeaconChainLive do
           }
         }
       ) do
-    new_next_summary =
+    next_summary_time =
       if :gt == DateTime.compare(next_summary_date, DateTime.utc_now()) do
         next_summary_date
       else
         BeaconChain.next_summary_date(DateTime.utc_now())
       end
 
-    new_dates = [new_next_summary | dates]
+    new_dates = [next_summary_time | dates]
 
-    # Caching transactions =
-    #   new_dates
-    #   |> Enum.at(page - 1)
-    #   |> list_transaction_by_date()
-    date =
-      new_dates
-      |> Enum.at(page - 1)
+    date = Enum.at(new_dates, page - 1)
 
     {:ok, transactions} =
       TransactionCache.resolve(date, fn ->
@@ -219,7 +210,7 @@ defmodule ArchethicWeb.BeaconChainLive do
       socket
       |> assign(:transactions, transactions)
       |> assign(:dates, new_dates)
-      |> assign(:next_summary_time, new_next_summary)
+      |> assign(:next_summary_time, next_summary_time)
 
     {:noreply, new_assign}
   end
@@ -242,49 +233,6 @@ defmodule ArchethicWeb.BeaconChainLive do
     |> SummaryTimer.previous_summaries()
     |> Enum.sort({:desc, DateTime})
   end
-
-  defp get_beacon_summary_transaction_chain(beacon_address, nodes, patch) do
-    nodes
-    |> P2P.nearest_nodes(patch)
-    |> do_get_download_summary_transaction_chain(beacon_address)
-  end
-
-  defp do_get_download_summary_transaction_chain(nodes, address, opts \\ [], acc \\ [])
-
-  defp do_get_download_summary_transaction_chain(
-         nodes = [node | rest],
-         address,
-         opts,
-         acc
-       ) do
-    message = %GetTransactionChain{
-      address: address,
-      paging_state: Keyword.get(opts, :paging_state)
-    }
-
-    case P2P.send_message(node, message) do
-      {:ok, %TransactionList{transactions: transactions, more?: false}} ->
-        {:ok, Enum.uniq_by(acc ++ transactions, & &1.address)}
-
-      {:ok, %TransactionList{transactions: transactions, more?: true, paging_state: paging_state}} ->
-        do_get_download_summary_transaction_chain(
-          nodes,
-          address,
-          [paging_state: paging_state],
-          Enum.uniq_by(acc ++ transactions, & &1.address)
-        )
-
-      {:error, _} ->
-        do_get_download_summary_transaction_chain(
-          rest,
-          address,
-          opts,
-          acc
-        )
-    end
-  end
-
-  defp do_get_download_summary_transaction_chain([], _, _, _), do: {:error, :network_issue}
 
   defp list_transaction_by_date(date = %DateTime{}) do
     Enum.reduce(BeaconChain.list_subsets(), %{}, fn subset, acc ->
@@ -326,25 +274,85 @@ defmodule ArchethicWeb.BeaconChainLive do
 
   defp list_transaction_by_date(nil), do: []
 
-  defp list_transaction_by_date_from_tx_chain(date = %DateTime{}) do
+  defp list_transaction_from_current_chain do
     %Node{network_patch: patch} = P2P.get_node_info()
 
-    Task.Supervisor.async_stream(TaskSupervisor, BeaconChain.list_subsets(), fn subset ->
-      b_address = Crypto.derive_beacon_chain_address(subset, date, true)
-      node_list = P2P.authorized_and_available_nodes()
-      nodes = Election.beacon_storage_nodes(subset, date, node_list)
+    ref_time = DateTime.utc_now() |> DateTime.truncate(:millisecond)
 
-      {:ok, transactions} = get_beacon_summary_transaction_chain(b_address, nodes, patch)
+    genesis_date = BeaconChain.previous_summary_time(ref_time)
+    next_summary_date = BeaconChain.next_summary_date(ref_time)
 
-      transactions
-      |> Stream.map(&deserialize_beacon_transaction/1)
-      |> Enum.to_list()
+    Task.async_stream(BeaconChain.list_subsets(), fn subset ->
+      b_address = Crypto.derive_beacon_chain_address(subset, genesis_date)
+      node_list = P2P.authorized_nodes()
+
+      nodes =
+        subset
+        |> Election.beacon_storage_nodes(next_summary_date, node_list)
+        |> P2P.nearest_nodes(patch)
+
+      with {:ok, last_address} <- get_last_beacon_address(nodes, b_address),
+           {:ok, transactions} <- get_beacon_chain(nodes, last_address) do
+        transactions
+        |> Stream.filter(&(&1.type == :beacon))
+        |> Stream.map(&deserialize_beacon_transaction/1)
+        |> Enum.to_list()
+      else
+        {:error, :network_issue} ->
+          []
+      end
     end)
     |> Enum.map(fn {:ok, txs} -> txs end)
     |> :lists.flatten()
     |> Enum.sort_by(& &1.timestamp, {:desc, DateTime})
   end
 
+  defp get_last_beacon_address([node | rest], address) do
+    case P2P.send_message(node, %GetLastTransactionAddress{
+           address: address,
+           timestamp: DateTime.utc_now()
+         }) do
+      {:ok, %LastTransactionAddress{address: last_address}} ->
+        {:ok, last_address}
+
+      {:error, _} ->
+        get_last_beacon_address(rest, address)
+    end
+  end
+
+  defp get_last_beacon_address([], _), do: {:error, :network_issue}
+
+  defp get_beacon_chain(nodes, address, opts \\ [], acc \\ [])
+
+  defp get_beacon_chain(nodes = [node | rest], address, opts, acc) do
+    message = %GetTransactionChain{
+      address: address,
+      paging_state: Keyword.get(opts, :paging_state)
+    }
+
+    case P2P.send_message(node, message) do
+      {:ok, %TransactionList{transactions: transactions, more?: false}} ->
+        {:ok, Enum.uniq_by(acc ++ transactions, & &1.address)}
+
+      {:ok, %TransactionList{transactions: transactions, more?: true, paging_state: paging_state}} ->
+        get_beacon_chain(
+          nodes,
+          address,
+          [paging_state: paging_state],
+          Enum.uniq_by(acc ++ transactions, & &1.address)
+        )
+
+      {:error, _} ->
+        get_beacon_chain(
+          rest,
+          address,
+          opts,
+          acc
+        )
+    end
+  end
+
+  defp get_beacon_chain([], _, _, _), do: {:error, :network_issue}
   def list_transaction_by_date_from_beacon_summary(nil), do: []
 
   def list_transaction_by_date_from_beacon_summary(date = %DateTime{}) do
@@ -385,7 +393,10 @@ defmodule ArchethicWeb.BeaconChainLive do
     |> Enum.sort_by(& &1.timestamp, {:desc, DateTime})
   end
 
-  defp deserialize_beacon_transaction(%Transaction{data: %TransactionData{content: content}}) do
+  defp deserialize_beacon_transaction(%Transaction{
+         type: :beacon,
+         data: %TransactionData{content: content}
+       }) do
     {slot, _} = Slot.deserialize(content)
     %Slot{transaction_attestations: transaction_attestations} = slot
     Enum.map(transaction_attestations, & &1.transaction_summary)
